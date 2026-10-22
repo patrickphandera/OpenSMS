@@ -128,7 +128,10 @@ class OpenSmsApp(MDApp):
             except Exception as e:
                 print(f"Could not check the android SDK version: {e}")
                 #self.show_toast_msg(f"Error checking SDK: {e}", is_error=True)
-            self.android_permissions = [Permission.WAKE_LOCK, Permission.SEND_SMS, Permission.POST_NOTIFICATIONS]
+            self.android_sdk_version = sdk_version
+            # Only dangerous (runtime) permissions that exist on this SDK are requested.
+            # WAKE_LOCK is a normal permission, granted at install time from the manifest.
+            self.android_permissions = self.get_runtime_permissions()
             request_permissions(self.android_permissions)
             self.internal_storage = app_storage_path()
             self.config_dir = os.path.join(self.internal_storage, 'config')
@@ -252,39 +255,106 @@ class OpenSmsApp(MDApp):
         else:
             self.new_api_key_pop()
 
-    def check_request_android_permission(self):
-        if platform == "android":
-            permission_flag = True
-            for permission in self.android_permissions:
-                tmp_flag = check_permission(permission)
-                if not tmp_flag:
-                    permission_flag = False
-                    break
-            if not permission_flag:
-                request_permissions(self.android_permissions, self.permission_callback)
-            return permission_flag
-        else:
+    ## Android permission handling
+    def get_runtime_permissions(self):
+        """Runtime (dangerous) permissions this app needs on the running Android version.
+
+        The app only sends SMS, so SEND_SMS is the single SMS permission required
+        (READ_SMS / RECEIVE_SMS are not used anywhere).
+        POST_NOTIFICATIONS only exists as a runtime permission on Android 13+ (API 33).
+        Requesting it on older versions makes the system silently deny it, which
+        previously made the app believe the user had blocked it.
+        """
+        if platform != "android":
+            return []
+        permissions = [Permission.SEND_SMS]
+        if getattr(self, "android_sdk_version", 28) >= 33:
+            permissions.append(Permission.POST_NOTIFICATIONS)
+        return permissions
+
+    def are_notifications_enabled(self):
+        """True if notifications are enabled for this app (works on Android 10 .. latest).
+
+        Uses NotificationManagerCompat.areNotificationsEnabled() when AndroidX is
+        available and falls back to the platform NotificationManager (API 24+).
+        """
+        if platform != "android":
             return True
+        PythonActivity = autoclass('org.kivy.android.PythonActivity')
+        context = PythonActivity.mActivity
+        try:
+            NotificationManagerCompat = autoclass('androidx.core.app.NotificationManagerCompat')
+            return bool(NotificationManagerCompat.from_(context).areNotificationsEnabled())
+        except Exception as e:
+            print(f"NotificationManagerCompat unavailable, using NotificationManager: {e}")
+        try:
+            Context = autoclass('android.content.Context')
+            notification_manager = cast(
+                'android.app.NotificationManager',
+                context.getSystemService(Context.NOTIFICATION_SERVICE)
+            )
+            return bool(notification_manager.areNotificationsEnabled())
+        except Exception as e:
+            # Never block the user because the check itself failed.
+            print(f"Could not check notification status, assuming enabled: {e}")
+            return True
+
+    def get_missing_permissions(self):
+        return [p for p in self.get_runtime_permissions() if not check_permission(p)]
+
+    def check_request_android_permission(self):
+        if platform != "android":
+            return True
+        # 1) SMS (and, on Android 13+, POST_NOTIFICATIONS) runtime permissions
+        missing = self.get_missing_permissions()
+        if missing:
+            print(f"Requesting missing permissions: {missing}")
+            request_permissions(missing, self.permission_callback)
+            return False
+        # 2) Notification toggle, checked separately from the runtime permissions.
+        # On Android 12 and below there is no runtime permission; the user can
+        # only turn notifications off from Settings, so redirect there if they did.
+        if not self.are_notifications_enabled():
+            print("Notifications are disabled for the app")
+            Clock.schedule_once(lambda dt: self.show_settings_popup(notifications=True))
+            return False
+        return True
 
     def permission_callback(self, permissions, results):
         # results is a list of booleans corresponding to requested permissions
-        usr_deny_flag = False
-        if False in results:
-            # the user checked "Don't ask again" or denied it twice.
-            PythonActivity = autoclass('org.kivy.android.PythonActivity')
-            current_activity = PythonActivity.mActivity
-            # Check rationale status via Android API
-            for permission in permissions:
+        denied = [p for p, granted in zip(permissions, results) if not granted]
+        if not denied:
+            print("All requested permissions granted")
+            return
+        PythonActivity = autoclass('org.kivy.android.PythonActivity')
+        current_activity = PythonActivity.mActivity
+        # Only the *denied* permissions matter here. If Android will not show the
+        # request dialog again, the user chose "Don't ask again" / denied twice.
+        blocked = []
+        for permission in denied:
+            try:
                 should_show = current_activity.shouldShowRequestPermissionRationale(permission)
-                if not should_show:
-                    usr_deny_flag = True
-                    break
-            if usr_deny_flag:
-                # User denied twice / blocked permanently! Show redirect popup.
-                print("Permission is denied by user!")
-                Clock.schedule_once(lambda dt: self.show_settings_popup())
+            except Exception as e:
+                print(f"Rationale check failed for {permission}: {e}")
+                should_show = True
+            if not should_show:
+                blocked.append(permission)
+        if blocked:
+            print(f"Permission permanently denied by user: {blocked}")
+            Clock.schedule_once(lambda dt: self.show_settings_popup(permissions=blocked))
+        else:
+            print(f"Permission denied (can ask again): {denied}")
 
-    def show_settings_popup(self):
+    def show_settings_popup(self, permissions=None, notifications=False):
+        if notifications:
+            message = "Notifications are turned off for OpenSMS. Please enable them from Settings."
+        elif permissions and all("SMS" in p for p in permissions):
+            message = "You need to grant the SMS permission from Settings."
+        elif permissions and all("NOTIFICATION" in p for p in permissions):
+            message = "You need to grant the Notifications permission from Settings."
+        else:
+            message = "You need to grant the SMS & Notifications permissions from Settings."
+        self._settings_popup_notifications = notifications
         buttons = MDDialogButtonContainer(
             Widget(),
             MDButton(
@@ -307,7 +377,7 @@ class OpenSmsApp(MDApp):
         )
         self.show_text_dialog(
             "Permissions Missing",
-            "You need to grant the SMS & Notifications permissions from Settings.",
+            message,
             None,
             buttons
         )
@@ -319,11 +389,16 @@ class OpenSmsApp(MDApp):
         Settings = autoclass('android.provider.Settings')
         Uri = autoclass('android.net.Uri')
         PythonActivity = autoclass('org.kivy.android.PythonActivity')
-        # Create intent to open this specific app's settings details
         activity = PythonActivity.mActivity
-        intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
-        uri = Uri.fromParts("package", activity.getPackageName(), None)
-        intent.setData(uri)
+        if getattr(self, "_settings_popup_notifications", False):
+            # Open this app's notification settings page (API 26+)
+            intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+            intent.putExtra(Settings.EXTRA_APP_PACKAGE, activity.getPackageName())
+        else:
+            # Create intent to open this specific app's settings details
+            intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+            uri = Uri.fromParts("package", activity.getPackageName(), None)
+            intent.setData(uri)
         # Launch settings
         activity.startActivity(intent)
 

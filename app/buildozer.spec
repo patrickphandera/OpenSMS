@@ -241,7 +241,8 @@ android.accept_sdk_license = True
 #android.add_resources =
 
 # (list) Gradle dependencies to add
-#android.gradle_dependencies =
+# androidx.core provides NotificationManagerCompat used for the notification-enabled check
+android.gradle_dependencies = androidx.core:core:1.13.1
 
 # (bool) Enable AndroidX support. Enable when 'android.gradle_dependencies'
 # contains an 'androidx' package, or any package from Kotlin source.
